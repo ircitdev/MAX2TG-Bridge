@@ -50,6 +50,10 @@ _HTTP_HEADERS = {
     "Sec-Fetch-Dest": "empty",
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "cross-site",
+    # Override the browser default to avoid brotli/zstd: aiohttp ships without
+    # these codecs by default, and the MAX upload server returns its JSON body
+    # brotli-encoded when "br" is advertised.
+    "Accept-Encoding": "gzip, deflate",
 }
 
 
@@ -65,8 +69,13 @@ class OpCode(IntEnum):
     CONTACT_PRESENCE = 35
     CHAT_GET = 48
     SEND_MESSAGE = 64
+    ATTACH_TYPING = 65        # "I'm uploading <type> in this chat"
     EDIT_MESSAGE = 67
+    PHOTO_UPLOAD_URL = 80     # get URL for photo upload
+    AUDIO_UPLOAD_URL = 86     # get URL for voice/audio upload (experimental)
+    FILE_UPLOAD_URL = 87      # get URL for file upload
     DISPATCH = 128
+    UPLOAD_READY = 136        # server says an uploaded file/video is processed
 
 
 @dataclass
@@ -101,6 +110,7 @@ class MaxClient:
         self._session: aiohttp.ClientSession | None = None
         self._dispatch_counter = 0
         self._pending: dict[int, asyncio.Future] = {}
+        self._file_pending: dict[int, asyncio.Future] = {}
         self._on_disconnect_cb = None
         if chat_ids:
             self.chat_ids += map(int, map(str.strip, chat_ids.split(',')))
@@ -191,7 +201,7 @@ class MaxClient:
                                     "deviceType": "WEB",
                                     "deviceName": "Chrome 131.0.0.0",
                                 },
-                                "appVersion": "25.12.11",
+                                "appVersion": "26.2.2",
                             },
                         )
 
@@ -249,7 +259,7 @@ class MaxClient:
         elif cmd == 3 and seq in self._pending:
             fut = self._pending.pop(seq)
             if not fut.done():
-                fut.set_result({})
+                fut.set_result({"_max_error": payload})
             log.warning("<<< ERROR op=%-4s seq=%s | %s", op, seq, payload)
 
         # server-initiated events — not a reply to one of our requests
@@ -291,6 +301,15 @@ class MaxClient:
                         task = asyncio.create_task(self._on_message_cb(msg))
                         task.add_done_callback(_log_task_exception)
 
+            elif op == OpCode.UPLOAD_READY:
+                # Server confirms an uploaded file/video finished server-side processing.
+                file_id = payload.get("fileId")
+                if file_id is not None:
+                    fut = self._file_pending.pop(int(file_id), None)
+                    if fut and not fut.done():
+                        fut.set_result(payload)
+                log.debug("UPLOAD_READY op=136: %s", payload)
+
             elif op in (OpCode.HEARTBEAT_PING,):
                 log.debug("Heartbeat op=%s", op)
 
@@ -309,21 +328,278 @@ class MaxClient:
         log.info("fetch_contacts(%s) → keys: %s", contact_ids, list(resp.keys()))
         return resp
 
-    async def send_message(self, chat_id, text: str, elements=None) -> dict:
-        """Send a text message to a Max chat. Returns the server response."""
+    async def send_message(self, chat_id, text: str = "", elements=None,
+                            attaches=None) -> dict:
+        """Send a message to a Max chat. Returns the server response.
+
+        Both ``elements`` (text formatting) and ``attaches`` (photos, files,
+        voice, ...) are optional. Pass an empty ``text`` together with an
+        attach to send a media-only message.
+        """
         if elements is None:
             elements = []
+        if attaches is None:
+            attaches = []
         cid = int(time.time() * 1000) * 1000 + random.randint(0, 999)
+        message = {"text": text, "cid": cid, "elements": elements}
+        if attaches:
+            message["attaches"] = attaches
         resp = await self.cmd(
             OpCode.SEND_MESSAGE,
             {
                 "chatId": chat_id,
-                "message": {"text": text, "cid": cid, "elements": elements},
+                "message": message,
                 "notify": True,
             },
         )
-        log.info("send_message(chat=%s) → %s", chat_id, "OK" if resp else "FAIL")
+        ok = bool(resp) and "_max_error" not in resp
+        log.info("send_message(chat=%s, attaches=%d) → %s",
+                 chat_id, len(attaches), "OK" if ok else "FAIL")
         return resp
+
+    # ── media upload ───────────────────────────────────────────────
+
+    async def upload_photo(self, data: bytes, chat_id=None,
+                            filename: str = "image.jpg",
+                            mimetype: str = "image/jpeg") -> dict | None:
+        """Upload a photo and return an attach dict for send_message.
+
+        Protocol (reverse-engineered, see nsdkinx/vkmax):
+          1. opcode 80 → response.payload.url
+          2. (optional) opcode 65 → 'I'm uploading PHOTO' indicator
+          3. multipart POST file to URL → JSON {'photos': {key: {'token': ...}}}
+          4. token → {"_type": "PHOTO", "photoToken": token}
+        """
+        resp = await self.cmd(OpCode.PHOTO_UPLOAD_URL, {"count": 1})
+        if not resp or "_max_error" in resp:
+            log.error("Photo upload URL request failed: %s", resp)
+            return None
+        url = resp.get("url")
+        if not url:
+            log.error("Photo upload response missing 'url': %s", resp)
+            return None
+
+        if chat_id is not None:
+            await self.cmd(OpCode.ATTACH_TYPING,
+                           {"chatId": chat_id, "type": "PHOTO"})
+
+        body = await self._http_upload(url, data, filename, mimetype,
+                                        expect_json=True)
+        if not isinstance(body, dict):
+            return None
+
+        photos = body.get("photos") or {}
+        if not photos:
+            log.error("Photo upload OK but no 'photos' in response: %s", body)
+            return None
+        first = next(iter(photos.values()))
+        token = first.get("token") if isinstance(first, dict) else None
+        if not token:
+            log.error("Photo upload response missing token: %s", body)
+            return None
+        return {"_type": "PHOTO", "photoToken": token}
+
+    async def open_by_link(self, link: str) -> dict:
+        """Resolve a max.ru invite link via opcode 57.
+
+        Works for ``/join/<token>`` (group / channel invite — chat namespace).
+        ``/u/<token>`` (user share link) needs a different, undocumented
+        opcode that we haven't reverse-engineered yet — server returns
+        ``not.found`` for chat-namespace lookup.
+        """
+        resp = await self.cmd(57, {"link": link})
+        log.info("open_by_link(%s) → %s",
+                 link[:60], str(resp)[:300] if resp else resp)
+        return resp
+
+    async def download_audio_url(self, audio_id, chat_id, message_id,
+                                  token: str | None = None) -> str | None:
+        """Resolve an audio attach reference into a downloadable URL.
+
+        Empirically: opcodes 84/85/89 in this range are routed to the calls
+        service or other unrelated subsystems and a single proto.payload
+        validation failure tears down the whole WebSocket. So instead of
+        blind opcode probing, try the same HTTP URL pattern that MAX uses
+        for incoming photos — both are tokenised through the same CDN
+        (i.oneme.ru) and the audio `token` happens to look like the `r`
+        parameter used in photo baseUrls.
+        """
+        if not token:
+            log.warning("download_audio_url: no token in attach")
+            return None
+
+        # Candidate URL templates, ordered by likelihood.
+        candidates = [
+            f"https://i.oneme.ru/i?r={token}",
+            f"https://i.oneme.ru/a?r={token}",
+            f"https://i.oneme.ru/audio?r={token}",
+            f"https://i.oneme.ru/?audioId={audio_id}&token={token}",
+        ]
+        log.info("download_audio_url: trying %d HTTP candidates", len(candidates))
+        for url in candidates:
+            ok = await self._probe_audio_url(url)
+            if ok:
+                log.info("download_audio_url: found audio at %s", url[:80])
+                return url
+
+        # Last cheap try: maybe the audio is stored in the same backend as
+        # regular files, so opcode 88 (file_download) with audioId-as-fileId
+        # could resolve. This opcode is well-known and won't tear down WS.
+        try:
+            audio_id_int = int(audio_id)
+        except (TypeError, ValueError):
+            audio_id_int = None
+        if audio_id_int is not None and chat_id is not None and message_id:
+            resp = await self.cmd(88, {
+                "fileId": audio_id_int,
+                "chatId": chat_id,
+                "messageId": str(message_id),
+            })
+            log.info("download_audio_url op=88(file-as-audio) → %s",
+                     str(resp)[:400] if resp else resp)
+            if resp and "_max_error" not in resp:
+                url = resp.get("url")
+                if isinstance(url, str) and url.startswith("http"):
+                    return url
+
+        log.warning("download_audio_url: nothing resolved an audio URL")
+        return None
+
+    async def _probe_audio_url(self, url: str) -> bool:
+        """HEAD-probe a candidate URL — accept if HTTP 200 with non-HTML body."""
+        session = getattr(self, "_session", None)
+        close_after = False
+        if session is None or session.closed:
+            session = aiohttp.ClientSession(headers=_BROWSER_HEADERS)
+            close_after = True
+        try:
+            async with session.get(
+                url, headers=_HTTP_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                ct = resp.headers.get("Content-Type", "")
+                log.info("probe %s → HTTP %d, Content-Type=%s",
+                          url[:80], resp.status, ct)
+                if resp.status != 200:
+                    return False
+                # Reject obviously-HTML responses (error/redirect pages).
+                if "text/html" in ct.lower():
+                    return False
+                return True
+        except Exception:
+            log.exception("probe error for %s", url[:80])
+            return False
+        finally:
+            if close_after:
+                await session.close()
+
+    async def upload_audio(self, data: bytes, chat_id=None,
+                            filename: str = "voice.ogg",
+                            mimetype: str = "audio/ogg",
+                            timeout: float = 60.0) -> dict | None:
+        """Upload a voice / audio message.
+
+        Known limitation: MAX stores audio in a different namespace from
+        regular files; ``fileId`` from the file-upload path is rejected by
+        the audio service ("EJB service unavailable"). Until we figure out
+        the dedicated audio-upload endpoint, voice arrives in MAX as an
+        ``.ogg`` file rather than a voice bubble.
+        """
+        return await self.upload_file(
+            data, chat_id=chat_id, filename=filename, mimetype=mimetype,
+            attach_type="FILE", timeout=timeout,
+        )
+
+    async def upload_file(self, data: bytes, chat_id=None,
+                           filename: str = "file.bin",
+                           mimetype: str = "application/octet-stream",
+                           attach_type: str = "FILE",
+                           timeout: float = 60.0) -> dict | None:
+        """Upload a generic file (used for voice, audio, documents, video).
+
+        Unlike photos, the server processes the file asynchronously and only
+        then sends an opcode-136 UPLOAD_READY event. We wait for that event
+        before returning the attach dict — otherwise the SEND_MESSAGE that
+        follows would reference a file the server hasn't finished ingesting.
+        """
+        resp = await self.cmd(OpCode.FILE_UPLOAD_URL, {"count": 1})
+        if not resp or "_max_error" in resp:
+            log.error("File upload URL request failed: %s", resp)
+            return None
+        info_list = resp.get("info") or []
+        if not info_list:
+            log.error("File upload response missing 'info': %s", resp)
+            return None
+        info = info_list[0]
+        url = info.get("url")
+        file_id = info.get("fileId")
+        if not url or file_id is None:
+            log.error("File upload info missing url/fileId: %s", info)
+            return None
+
+        if chat_id is not None:
+            await self.cmd(OpCode.ATTACH_TYPING,
+                           {"chatId": chat_id, "type": attach_type})
+
+        # Register the pending future BEFORE the POST so the server's reply
+        # (which may arrive before our POST coroutine resumes) is not lost.
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._file_pending[int(file_id)] = fut
+
+        ok = await self._http_upload(url, data, filename, mimetype,
+                                      expect_json=False)
+        if not ok:
+            self._file_pending.pop(int(file_id), None)
+            return None
+
+        try:
+            await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._file_pending.pop(int(file_id), None)
+            log.warning("File upload server processing timed out (fileId=%s)",
+                        file_id)
+            return None
+
+        return {"_type": attach_type, "fileId": file_id}
+
+    async def _http_upload(self, url: str, data: bytes, filename: str,
+                            mimetype: str, expect_json: bool):
+        """POST multipart bytes to an upload URL. Returns parsed JSON if
+        ``expect_json`` is True, otherwise True on HTTP 200, or None on error.
+        """
+        session = getattr(self, "_session", None)
+        close_after = False
+        if session is None or session.closed:
+            session = aiohttp.ClientSession(headers=_BROWSER_HEADERS)
+            close_after = True
+        try:
+            form = aiohttp.FormData()
+            form.add_field("file", data, filename=filename, content_type=mimetype)
+            async with session.post(
+                url, headers=_HTTP_HEADERS, data=form,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                if resp.status != 200:
+                    body = (await resp.text())[:500]
+                    log.error("Upload POST failed: HTTP %d — %s",
+                              resp.status, body)
+                    return None
+                if expect_json:
+                    try:
+                        return await resp.json()
+                    except Exception:
+                        log.exception("Upload response is not JSON")
+                        return None
+                # consume body to release connection
+                await resp.read()
+                return True
+        except Exception:
+            log.exception("Upload POST error: %s", url[:120])
+            return None
+        finally:
+            if close_after:
+                await session.close()
 
     async def download_file(self, url: str) -> bytes | None:
         """Download a file by URL, returning raw bytes or None on failure."""

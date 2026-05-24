@@ -15,10 +15,16 @@ class ContactResolver:
     def __init__(self, client: MaxClient | None = None):
         self.chats: dict[Any, str] = {}
         self.chat_types: dict[Any, str] = {}
+        self.chats_raw: dict[Any, dict] = {}      # full chat snapshot per id
         self.users: dict[Any, str] = {}
+        self.contacts_raw: dict[Any, dict] = {}   # full contact dicts per id
         self._client = client
         self._fetch_failed: set = set()
         self._my_id: Any = None
+
+    @property
+    def my_id(self) -> Any:
+        return self._my_id
 
     def chat_name(self, chat_id: Any) -> str:
         return self.chats.get(chat_id, str(chat_id))
@@ -69,6 +75,8 @@ class ContactResolver:
 
             if cid is None:
                 continue
+
+            self.chats_raw[cid] = chat
 
             if ctype:
                 self.chat_types[cid] = ctype
@@ -126,6 +134,8 @@ class ContactResolver:
             if not isinstance(c, dict):
                 continue
             uid = c.get("id") or c.get("userId")
+            if uid is not None:
+                self.contacts_raw[uid] = c
             name = self._extract_name_from_contact(c)
             if uid is not None and name:
                 self.users[uid] = name
@@ -150,6 +160,8 @@ class ContactResolver:
             name = self._extract_name_from_contact(obj)
             if uid is not None and name and uid not in self.users:
                 self.users[uid] = name
+                if uid not in self.contacts_raw:
+                    self.contacts_raw[uid] = obj
                 log.info("Deep-resolved contact %s → %s", uid, name)
             for v in obj.values():
                 self._deep_extract(v, depth + 1)

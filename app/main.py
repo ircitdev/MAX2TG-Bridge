@@ -12,6 +12,7 @@ from app.config import load_settings
 from app.max_listener import create_max_client
 from app.tg_handler import build_tg_app
 from app.tg_sender import TelegramSender
+from app.topics import TopicStore
 
 threading.stack_size(524288)
 
@@ -70,17 +71,22 @@ async def main():
     if settings.tg_proxy:
         log.info("Using Telegram proxy: %s", settings.tg_proxy.split("@")[-1])
 
-    sender = TelegramSender(settings.tg_bot_token, settings.tg_chat_id, proxy_url=settings.tg_proxy)
+    os.makedirs(settings.state_dir, exist_ok=True)
+    topic_store = TopicStore(os.path.join(settings.state_dir, "topics.json"))
+
+    sender = TelegramSender(settings.tg_bot_token, settings.tg_chat_id, topic_store,
+                            proxy_url=settings.tg_proxy)
     await sender.start()
 
     client = create_max_client(
         settings.max_token, settings.max_device_id, sender, settings.max_chat_ids,
-        debug=settings.debug, reply_enabled=settings.reply_enabled,
+        debug=settings.debug,
     )
 
     tg_app = None
     if settings.reply_enabled:
         tg_app = build_tg_app(settings.tg_bot_token, client, settings.tg_chat_id,
+                              topic_store, allowed_user_id=settings.tg_allowed_user_id,
                               proxy_url=settings.tg_proxy)
         await tg_app.initialize()
         await tg_app.start()
