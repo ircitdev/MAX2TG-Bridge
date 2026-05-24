@@ -36,11 +36,13 @@ _TG_TO_MAX_ELEMENT_TYPE = {
     MessageEntityType.STRIKETHROUGH: "STRIKETHROUGH",
     MessageEntityType.UNDERLINE: "UNDERLINE",
     MessageEntityType.CODE: "MONOSPACED",
-    # MAX has no boxed code-block style, so multi-line code from Telegram and
-    # real Telegram blockquotes both land as MAX's quote style.
-    MessageEntityType.PRE: "BLOCKQUOTE",
-    MessageEntityType.BLOCKQUOTE: "BLOCKQUOTE",
-    MessageEntityType.EXPANDABLE_BLOCKQUOTE: "BLOCKQUOTE",
+    # MAX's WebSocket protocol exposes a smaller element enum than its bot
+    # HTTP API: BLOCKQUOTE / CODE_BLOCK / HIGHLIGHTED / HEADING are all
+    # rejected with "No enum constant". Best fallback for multi-line code
+    # is the same monospace style as inline code. Telegram blockquotes
+    # have no MAX counterpart at all — let them through as plain text
+    # rather than fail the whole send_message.
+    MessageEntityType.PRE: "MONOSPACED",
 }
 
 
