@@ -275,3 +275,149 @@ class TestMaxClientInit:
 
         result = c.on_disconnect(my_handler)
         assert result is my_handler
+
+
+# ---------------------------------------------------------------------------
+# on_ready must not block the WebSocket read loop
+# ---------------------------------------------------------------------------
+
+class TestOnReadyDoesNotBlockReadLoop:
+    """Regression: on_ready issues its own cmd() calls, and the responses to
+    those calls can only be read by the same loop that dispatched on_ready.
+    Awaiting the callback inline deadlocks until every such request hits its
+    10s timeout, which silently empties the startup contact batch-resolve.
+
+    Both tests use wait_for so the unfixed code fails fast instead of hanging.
+    """
+
+    async def test_handle_does_not_await_callback_to_completion(self):
+        import asyncio
+        from app.max_client import MaxClient
+
+        client = MaxClient(token="t", device_id="d")
+        released = asyncio.Event()
+        finished = asyncio.Event()
+
+        @client.on_ready
+        async def slow_ready(snapshot):
+            await released.wait()
+            finished.set()
+
+        snapshot_frame = {"opcode": 19, "cmd": 1, "seq": 0,
+                          "payload": {"profile": {"id": 42}}}
+        try:
+            await asyncio.wait_for(client._handle(snapshot_frame), timeout=2)
+        except asyncio.TimeoutError:
+            pytest.fail(
+                "_handle() blocked until on_ready finished: the WebSocket read "
+                "loop is stalled, so replies to requests issued inside on_ready "
+                "can never be delivered."
+            )
+
+        assert not finished.is_set(), "callback should still be running in the background"
+
+        released.set()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert finished.is_set()
+
+    async def test_request_issued_from_on_ready_receives_its_response(self):
+        """End-to-end shape of the bug: fetch_contacts() called inside on_ready
+        must resolve once the loop delivers the matching frame."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        from app.max_client import MaxClient
+
+        client = MaxClient(token="t", device_id="d")
+        client._ws = AsyncMock()
+        client._ws.closed = False
+        result = {}
+
+        @client.on_ready
+        async def ready(snapshot):
+            result["contacts"] = await client.fetch_contacts([777])
+
+        try:
+            await asyncio.wait_for(
+                client._handle({"opcode": 19, "cmd": 1, "seq": 0,
+                                "payload": {"profile": {"id": 42}}}),
+                timeout=2,
+            )
+        except asyncio.TimeoutError:
+            pytest.fail("_handle() blocked on on_ready; see the test above.")
+
+        await asyncio.sleep(0)
+        assert client._pending, "on_ready's cmd() should be waiting for a response"
+
+        seq = next(iter(client._pending))
+        await client._handle({
+            "opcode": 32, "cmd": 1, "seq": seq,
+            "payload": {"contacts": [{"id": 777, "names": [{"name": "Elena"}]}]},
+        })
+        await asyncio.sleep(0)
+
+        assert result["contacts"]["contacts"][0]["names"][0]["name"] == "Elena"
+
+
+class TestOnReadySingleFlight:
+    """A reconnect delivers a fresh snapshot that supersedes the previous run,
+    so at most one on_ready may be in flight."""
+
+    async def test_new_snapshot_cancels_previous_run(self):
+        import asyncio
+        from app.max_client import MaxClient
+
+        client = MaxClient(token="t", device_id="d")
+        started = []
+        cancelled = []
+
+        @client.on_ready
+        async def slow_ready(snapshot):
+            started.append(snapshot["profile"]["id"])
+            try:
+                await asyncio.Event().wait()   # never completes on its own
+            except asyncio.CancelledError:
+                cancelled.append(snapshot["profile"]["id"])
+                raise
+
+        frame = lambda uid: {"opcode": 19, "cmd": 1, "seq": 0,
+                             "payload": {"profile": {"id": uid}}}
+
+        await client._handle(frame(1))
+        await asyncio.sleep(0)
+        first = client._ready_task
+
+        await client._handle(frame(2))          # reconnect: new snapshot
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        assert started == [1, 2]
+        assert cancelled == [1], "the previous on_ready should have been cancelled"
+        assert first.cancelled()
+        assert not client._ready_task.done(), "the new run must still be alive"
+
+        client._ready_task.cancel()
+
+    async def test_finished_run_is_not_cancelled_again(self):
+        import asyncio
+        from app.max_client import MaxClient
+
+        client = MaxClient(token="t", device_id="d")
+        runs = []
+
+        @client.on_ready
+        async def quick_ready(snapshot):
+            runs.append(snapshot["profile"]["id"])
+
+        frame = lambda uid: {"opcode": 19, "cmd": 1, "seq": 0,
+                             "payload": {"profile": {"id": uid}}}
+
+        await client._handle(frame(1))
+        await asyncio.sleep(0)
+        assert client._ready_task.done()
+
+        await client._handle(frame(2))
+        await asyncio.sleep(0)
+
+        assert runs == [1, 2]
+        assert not client._ready_task.cancelled()
