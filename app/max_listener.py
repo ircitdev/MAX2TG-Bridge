@@ -282,10 +282,10 @@ def create_max_client(
             log.info("Known users: %s", resolver.users)
 
         if not _first_connect:
-            await sender.send("✅ <b>Max:</b> соединение восстановлено")
+            await sender.send_status("✅ <b>Max:</b> соединение восстановлено")
         else:
             chat_count = len(resolver.chats)
-            await sender.send(f"✅ <b>Max:</b> подключён | чатов: {chat_count}")
+            await sender.send_status(f"✅ <b>Max:</b> подключён | чатов: {chat_count}")
         _first_connect = False
 
     @client.on_disconnect
@@ -296,7 +296,7 @@ def create_max_client(
             return
         _notif_count += 1
         _last_notif_time = datetime.now()
-        await sender.send("⚠️ <b>Max:</b> соединение потеряно, переподключение...")
+        await sender.send_status("⚠️ <b>Max:</b> соединение потеряно, переподключение...")
 
     @client.on_message
     async def handle_message(msg: MaxMessage):

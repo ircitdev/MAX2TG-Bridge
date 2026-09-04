@@ -25,13 +25,14 @@ def _looks_numeric(title: str) -> bool:
 
 class TelegramSender:
     def __init__(self, token: str, chat_id: str, topic_store: TopicStore,
-                 proxy_url: str | None = None):
+                 proxy_url: str | None = None, status_chat_id: str | None = None):
         if proxy_url:
             request = HTTPXRequest(proxy=proxy_url)
             self._bot = Bot(token=token, request=request)
         else:
             self._bot = Bot(token=token)
         self._chat_id = chat_id
+        self._status_chat_id = status_chat_id
         self._topics = topic_store
         self._topic_lock = asyncio.Lock()
 
@@ -143,6 +144,36 @@ class TelegramSender:
                 message_thread_id=message_thread_id,
             )
         )
+
+    async def send_status(self, text: str) -> None:
+        """Send a bridge status notification (connected / lost / restored).
+
+        Goes to TG_STATUS_CHAT_ID when configured — typically the owner's private
+        chat — so these never land in the shared supergroup. Without it, falls
+        back to the supergroup's General topic (legacy behaviour).
+        """
+        if not text:
+            return
+
+        if not self._status_chat_id:
+            await self.send(text)
+            return
+
+        msg = await self._retry(
+            lambda: self._bot.send_message(
+                chat_id=self._status_chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+        )
+        if msg is None:
+            # Deliberately not falling back to the supergroup: the whole point
+            # of TG_STATUS_CHAT_ID is to keep these out of the shared group.
+            log.error(
+                "Failed to deliver status notification to %s (has the user "
+                "started a chat with the bot?): %s",
+                self._status_chat_id, text,
+            )
 
     async def send_photo(self, data: bytes, caption: str = "", filename: str = "photo.jpg",
                          message_thread_id: int | None = None) -> None:

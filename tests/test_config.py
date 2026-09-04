@@ -181,3 +181,29 @@ class TestLoadSettingsMissing:
         with pytest.raises(SystemExit) as exc:
             _load_settings_with_env(_env(MAX_TOKEN=""))
         assert "MAX_TOKEN" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# TG_STATUS_CHAT_ID — route bridge status notifications away from the group
+# ---------------------------------------------------------------------------
+
+class TestStatusChatId:
+    def test_defaults_to_none(self):
+        s = _load_settings_with_env(_env())
+        assert s.tg_status_chat_id is None
+
+    def test_empty_string_is_none(self):
+        s = _load_settings_with_env(_env(TG_STATUS_CHAT_ID=""))
+        assert s.tg_status_chat_id is None
+
+    def test_parsed_when_set(self):
+        s = _load_settings_with_env(_env(TG_STATUS_CHAT_ID="271753809"))
+        assert s.tg_status_chat_id == "271753809"
+
+    def test_negative_group_id_allowed(self):
+        s = _load_settings_with_env(_env(TG_STATUS_CHAT_ID="-100999"))
+        assert s.tg_status_chat_id == "-100999"
+
+    def test_non_integer_rejected(self):
+        with pytest.raises(SystemExit):
+            _load_settings_with_env(_env(TG_STATUS_CHAT_ID="not-a-number"))

@@ -16,6 +16,7 @@ class Settings:
     reply_enabled: bool = False
     state_dir: str = "state"
     tg_allowed_user_id: int | None = None
+    tg_status_chat_id: str | None = None
 
 
 def load_settings() -> Settings:
@@ -36,6 +37,15 @@ def load_settings() -> Settings:
         raise SystemExit(
             f"TG_CHAT_ID must be a valid integer, got: {tg_chat_id!r}"
         )
+
+    status_chat_id = os.environ.get("TG_STATUS_CHAT_ID") or None
+    if status_chat_id:
+        try:
+            int(status_chat_id)
+        except ValueError:
+            raise SystemExit(
+                f"TG_STATUS_CHAT_ID must be a valid integer, got: {status_chat_id!r}"
+            )
 
     allowed_raw = os.environ.get("TG_ALLOWED_USER_ID") or None
     allowed_user_id: int | None = None
@@ -58,4 +68,5 @@ def load_settings() -> Settings:
         reply_enabled=os.environ.get("REPLY_ENABLED", "").lower() in ("1", "true", "yes"),
         state_dir=os.environ.get("STATE_DIR") or "state",
         tg_allowed_user_id=allowed_user_id,
+        tg_status_chat_id=status_chat_id,
     )
