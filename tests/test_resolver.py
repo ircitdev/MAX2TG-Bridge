@@ -1,6 +1,8 @@
 """Tests for app/resolver.py — ContactResolver."""
 
 import pytest
+from unittest.mock import AsyncMock
+
 from app.resolver import ContactResolver
 
 
@@ -340,3 +342,34 @@ class TestResolveUser:
         result = await resolver.resolve_user(77)
         assert result == "Fetched User"
         assert 77 not in resolver._fetch_failed
+
+
+# ---------------------------------------------------------------------------
+# Channel posts carry no sender
+# ---------------------------------------------------------------------------
+
+class TestNullSender:
+    """A None sender must never reach CONTACT_GET: the server rejects
+    contactIds=[None] with `proto.payload`, and that closes the WebSocket."""
+
+    async def test_none_does_not_hit_the_wire(self):
+        client = AsyncMock()
+        r = ContactResolver(client=client)
+        assert await r.resolve_user(None) == ""
+        client.fetch_contacts.assert_not_awaited()
+
+    async def test_none_is_not_cached_as_a_failure(self):
+        """Otherwise a later real lookup could be skipped by the same cache."""
+        client = AsyncMock()
+        r = ContactResolver(client=client)
+        await r.resolve_user(None)
+        assert None not in r._fetch_failed
+
+    async def test_real_ids_still_resolve(self):
+        client = AsyncMock()
+        client.fetch_contacts.return_value = {
+            "contacts": [{"id": 42, "names": [{"name": "Elena"}]}]
+        }
+        r = ContactResolver(client=client)
+        assert await r.resolve_user(42) == "Elena"
+        client.fetch_contacts.assert_awaited_once()

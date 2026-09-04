@@ -144,3 +144,13 @@ class TestGuessMediaKind:
     # Extension appearing in the middle of filename should not trigger false match
     def test_mp4_in_name_not_extension_is_document(self):
         assert _guess_media_kind("mp4_notes.txt") == "document"
+
+
+class TestHeaderWithoutSender:
+    def test_channel_post_has_no_dangling_separator(self):
+        from app.max_listener import _header
+        assert _header(None, "", "Канал", is_dm=False) == "💬 <b>Канал</b>"
+
+    def test_named_sender_is_still_appended(self):
+        from app.max_listener import _header
+        assert _header(None, "Елена", "Канал", is_dm=False) == "💬 <b>Канал</b> | Елена"

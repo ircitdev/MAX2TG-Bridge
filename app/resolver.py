@@ -36,6 +36,13 @@ class ContactResolver:
         return self.users.get(user_id, str(user_id))
 
     async def resolve_user(self, user_id: Any) -> str:
+        # Channel posts arrive with no sender. Passing that straight into
+        # CONTACT_GET makes the server reject the frame with `proto.payload`,
+        # which closes the WebSocket — MAX then re-delivers the message after
+        # the reconnect and it gets posted to Telegram twice.
+        if user_id is None:
+            return ""
+
         if user_id in self.users:
             return self.users[user_id]
         if user_id in self._fetch_failed:

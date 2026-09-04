@@ -16,6 +16,9 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 def _header(msg: MaxMessage, sender_label: str, chat_label: str, is_dm: bool) -> str:
     if is_dm:
         return f"✉ <b>{sender_label}</b>"
+    # Channel posts have no sender — don't leave a dangling separator.
+    if not sender_label:
+        return f"💬 <b>{chat_label}</b>"
     return f"💬 <b>{chat_label}</b> | {sender_label}"
 
 
