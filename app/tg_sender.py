@@ -2,7 +2,7 @@ import asyncio
 import io
 import logging
 
-from telegram import Bot, InputFile
+from telegram import Bot, InputFile, InputMediaPhoto, InputMediaVideo
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TimedOut
 from telegram.request import HTTPXRequest
@@ -14,6 +14,7 @@ log = logging.getLogger(__name__)
 TG_MAX_LENGTH = 4096
 TG_CAPTION_MAX = 1024
 TG_TOPIC_NAME_MAX = 128
+TG_MEDIA_GROUP_MAX = 10
 MAX_RETRIES = 3
 
 
@@ -156,6 +157,54 @@ class TelegramSender:
                 message_thread_id=message_thread_id,
             )
         )
+
+    async def send_media_group(self, items: list[tuple[str, bytes, str]], caption: str = "",
+                               message_thread_id: int | None = None) -> None:
+        """Send photos/videos as a single Telegram album.
+
+        ``items`` are ``(kind, data, filename)`` tuples with ``kind`` either
+        ``"photo"`` or ``"video"``. Telegram caps an album at 10 items, so
+        longer runs are split across several; the caption rides on the first
+        item of the first chunk. A lone item is sent as a plain photo/video,
+        since a one-element media group is rejected.
+        """
+        if not items:
+            return
+
+        if len(items) == 1:
+            kind, data, filename = items[0]
+            if kind == "video":
+                await self.send_video(data, caption=caption, filename=filename,
+                                      message_thread_id=message_thread_id)
+            else:
+                await self.send_photo(data, caption=caption, filename=filename,
+                                      message_thread_id=message_thread_id)
+            return
+
+        caption = self._truncate_caption(caption)
+
+        for start in range(0, len(items), TG_MEDIA_GROUP_MAX):
+            chunk = items[start:start + TG_MEDIA_GROUP_MAX]
+            first_chunk = start == 0
+
+            def _send(chunk=chunk, first_chunk=first_chunk):
+                # Rebuilt per attempt: _retry re-invokes this factory, and the
+                # BytesIO behind an InputFile cannot be read twice.
+                media = []
+                for i, (kind, data, filename) in enumerate(chunk):
+                    cls = InputMediaVideo if kind == "video" else InputMediaPhoto
+                    media.append(cls(
+                        media=InputFile(io.BytesIO(data), filename=filename),
+                        caption=caption if (first_chunk and i == 0 and caption) else None,
+                        parse_mode=ParseMode.HTML,
+                    ))
+                return self._bot.send_media_group(
+                    chat_id=self._chat_id,
+                    media=media,
+                    message_thread_id=message_thread_id,
+                )
+
+            await self._retry(_send)
 
     async def send_document(self, data: bytes, caption: str = "", filename: str = "file",
                             message_thread_id: int | None = None) -> None:

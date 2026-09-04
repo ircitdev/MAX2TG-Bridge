@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from html import escape
 
@@ -11,6 +13,143 @@ log = logging.getLogger(__name__)
 
 PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+
+# MAX delivers one album as several DISPATCH frames arriving a few hundred
+# milliseconds apart. Wait this long for more parts before posting to Telegram…
+ALBUM_WINDOW_SEC = 2.0
+# …but never hold media longer than this after the first item, so a steady
+# trickle of photos still gets posted.
+ALBUM_MAX_WAIT_SEC = 15.0
+
+
+@dataclass
+class _AlbumBucket:
+    thread_id: int | None
+    caption: str
+    deadline: float
+    items: list = field(default_factory=list)
+    timer: asyncio.Task | None = None
+
+
+class _AlbumBuffer:
+    """Collects groupable media so one logical album becomes one Telegram post.
+
+    A forwarded album reaches us as several separate MAX messages, and a single
+    message can itself carry several photos. Sent one at a time they land in
+    Telegram as a wall of individual posts. Media is therefore buffered per
+    (chat, sender) and flushed once nothing new has arrived for ``window``
+    seconds, or ``max_wait`` seconds after the first item if parts keep coming.
+    """
+
+    def __init__(self, sender, window: float = ALBUM_WINDOW_SEC,
+                 max_wait: float = ALBUM_MAX_WAIT_SEC):
+        self._sender = sender
+        self._window = window
+        self._max_wait = max_wait
+        self._buckets: dict = {}
+        self._lock = asyncio.Lock()
+
+    async def add(self, key, thread_id, caption: str, items: list) -> None:
+        if not items:
+            return
+
+        # A second, different caption means a second post — flush rather than
+        # silently drop the text that came with it.
+        async with self._lock:
+            bucket = self._buckets.get(key)
+            caption_clash = (
+                bucket is not None and caption
+                and bucket.caption and caption != bucket.caption
+            )
+        if caption_clash:
+            await self._flush(key, from_timer=False)
+
+        async with self._lock:
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                bucket = _AlbumBucket(
+                    thread_id=thread_id,
+                    caption=caption,
+                    deadline=time.monotonic() + self._max_wait,
+                )
+                self._buckets[key] = bucket
+            else:
+                if not bucket.caption and caption:
+                    bucket.caption = caption
+                # The first part of an album can arrive while ensure_topic is
+                # still failing, leaving thread_id None. Adopt a real one as
+                # soon as any later part carries it, or the whole album lands
+                # in General instead of the chat's topic.
+                if bucket.thread_id is None and thread_id is not None:
+                    bucket.thread_id = thread_id
+            bucket.items.extend(items)
+            if bucket.timer is not None:
+                bucket.timer.cancel()
+            delay = max(0.0, min(self._window, bucket.deadline - time.monotonic()))
+            bucket.timer = asyncio.create_task(self._flush_after(key, delay))
+
+    async def _flush_after(self, key, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        await self._flush(key, from_timer=True)
+
+    async def flush(self, key) -> None:
+        """Post whatever is buffered for ``key`` right now.
+
+        Called before anything that must not overtake the album — a document,
+        a sticker, a plain-text message.
+        """
+        await self._flush(key, from_timer=False)
+
+    async def _flush(self, key, from_timer: bool) -> None:
+        async with self._lock:
+            bucket = self._buckets.pop(key, None)
+            if bucket is None:
+                return
+            # Cancelling from inside the timer task would cancel ourselves.
+            if bucket.timer is not None and not from_timer:
+                bucket.timer.cancel()
+        try:
+            await self._sender.send_media_group(
+                bucket.items,
+                caption=bucket.caption,
+                message_thread_id=bucket.thread_id,
+            )
+            log.info("Posted album of %d item(s) for %s", len(bucket.items), key)
+        except Exception:
+            log.exception("Failed to post album for %s", key)
+
+
+async def _groupable_item(attach: dict, client) -> tuple[str, bytes, str] | None:
+    """Download an attachment if it can ride inside a Telegram album.
+
+    Only real photos and image/video files qualify. ``_type=VIDEO`` is left out
+    on purpose: MAX gives us just a thumbnail for those, and quietly dropping it
+    into an album would hide that the original is a video.
+    """
+    atype = attach.get("_type")
+
+    if atype == "PHOTO":
+        url = _extract_photo_url(attach)
+        if not url:
+            return None
+        data = await client.download_file(url)
+        return ("photo", data, "photo.jpg") if data else None
+
+    if atype == "FILE":
+        name = attach.get("name", "file")
+        kind = _guess_media_kind(name)
+        if kind not in ("photo", "video"):
+            return None
+        url = _extract_file_url(attach)
+        if not url:
+            return None
+        data = await client.download_file(url)
+        return (kind, data, name) if data else None
+
+    return None
 
 
 def _header(msg: MaxMessage, sender_label: str, chat_label: str, is_dm: bool) -> str:
@@ -41,6 +180,49 @@ def _guess_media_kind(filename: str) -> str:
         if name_lower.endswith(ext):
             return "video"
     return "document"
+
+
+
+async def _flush_album(albums, key) -> None:
+    if albums is not None:
+        await albums.flush(key)
+
+
+async def _send_attaches(attaches: list, client, sender, header_text: str,
+                         body_text: str, thread_id, msg, albums, key) -> bool:
+    """Route one message's attachments to Telegram.
+
+    Attachments are walked in order. Album-capable media accumulates in the
+    buffer (so parts of one album arriving as separate MAX frames end up as a
+    single Telegram post); anything else flushes that run first and is sent on
+    its own, which keeps mixed attachments in the order MAX sent them.
+
+    Returns True when ``body_text`` was already used as a caption.
+    """
+    caption = f"{header_text}\n{escape(body_text)}" if body_text else header_text
+
+    text_used = False
+    for attach in attaches:
+        cap = header_text if text_used else caption
+        item = await _groupable_item(attach, client)
+
+        if item is not None:
+            if albums is not None:
+                await albums.add(key, thread_id, cap, [item])
+            else:
+                await sender.send_media_group([item], caption=cap,
+                                              message_thread_id=thread_id)
+            log.info("Buffered album item → TG")
+        else:
+            # Anything that cannot ride in an album ends the current run, so
+            # the attachments keep the order MAX sent them in.
+            await _flush_album(albums, key)
+            await _send_attach(attach, client, sender, cap, thread_id=thread_id, msg=msg)
+            log.info("Forwarded attach _type=%s → TG", attach.get("_type"))
+
+        text_used = text_used or bool(body_text)
+
+    return text_used
 
 
 async def _send_attach(
@@ -192,6 +374,8 @@ async def _handle_linked_message(
     resolver: ContactResolver,
     thread_id: int | None = None,
     msg: MaxMessage | None = None,
+    albums=None,
+    key=None,
 ) -> None:
     """Handle FORWARD or REPLY link inside a message."""
     inner = link.get("message") or link
@@ -220,20 +404,18 @@ async def _handle_linked_message(
     ]
 
     if fwd_meaningful:
-        text_sent = False
-        for i, attach in enumerate(fwd_meaningful):
-            if i == 0 and fwd_text:
-                cap = f"{full_header}\n{escape(fwd_text)}"
-                text_sent = True
-            else:
-                cap = full_header
-            await _send_attach(attach, client, sender, cap, thread_id=thread_id, msg=msg)
-
+        text_sent = await _send_attaches(
+            fwd_meaningful, client, sender, full_header, fwd_text,
+            thread_id, msg, albums, key,
+        )
         if fwd_text and not text_sent:
+            await _flush_album(albums, key)
             await sender.send(f"{full_header}\n{escape(fwd_text)}", message_thread_id=thread_id)
     elif fwd_text:
+        await _flush_album(albums, key)
         await sender.send(f"{full_header}\n{escape(fwd_text)}", message_thread_id=thread_id)
     else:
+        await _flush_album(albums, key)
         await sender.send(f"{full_header}\n<i>[без содержимого]</i>", message_thread_id=thread_id)
 
 
@@ -251,6 +433,7 @@ def create_max_client(
 ) -> MaxClient:
     client = MaxClient(token=max_token, device_id=max_device_id, debug=debug, chat_ids=max_chat_ids)
     resolver = ContactResolver(client=client)
+    albums = _AlbumBuffer(sender)
     # Expose for tg_handler commands like /profile.
     client.resolver = resolver
 
@@ -343,12 +526,18 @@ def create_max_client(
         chat_label = escape(raw_chat)
         header_text = _header(msg, sender_label, chat_label, is_dm)
 
+        # One album is one (chat, sender) run of media arriving back to back.
+        album_key = (msg.chat_id, msg.sender_id)
+
         link = msg.link
         link_type = link.get("type") if isinstance(link, dict) else None
 
         if link_type in ("FORWARD", "REPLY"):
-            await _handle_linked_message(link, link_type, header_text, client, sender, resolver, thread_id=thread_id, msg=msg)
+            await _handle_linked_message(link, link_type, header_text, client, sender,
+                                         resolver, thread_id=thread_id, msg=msg,
+                                         albums=albums, key=album_key)
             if msg.text:
+                await _flush_album(albums, album_key)
                 await sender.send(f"{header_text}\n{escape(msg.text)}", message_thread_id=thread_id)
             log.info("Forwarded link type=%s → TG", link_type)
             return
@@ -359,19 +548,16 @@ def create_max_client(
         ]
 
         if meaningful_attaches:
-            text_sent = False
-            for i, attach in enumerate(meaningful_attaches):
-                if i == 0 and msg.text:
-                    cap = f"{header_text}\n{escape(msg.text)}"
-                    text_sent = True
-                else:
-                    cap = header_text
-                await _send_attach(attach, client, sender, cap, thread_id=thread_id, msg=msg)
-                log.info("Forwarded attach _type=%s → TG", attach.get("_type"))
-
+            text_sent = await _send_attaches(
+                meaningful_attaches, client, sender, header_text, msg.text,
+                thread_id, msg, albums, album_key,
+            )
             if msg.text and not text_sent:
+                await _flush_album(albums, album_key)
                 await sender.send(f"{header_text}\n{escape(msg.text)}", message_thread_id=thread_id)
         else:
+            # Plain text must not jump ahead of media still waiting in the buffer.
+            await _flush_album(albums, album_key)
             body = escape(msg.text) if msg.text else "<i>[нетекстовое сообщение]</i>"
             await sender.send(f"{header_text}\n{body}", message_thread_id=thread_id)
             log.info("Forwarded text → TG")
