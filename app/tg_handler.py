@@ -24,6 +24,7 @@ MAX_CLIENT_KEY = "max_client"
 TOPIC_STORE_KEY = "topic_store"
 ALLOWED_USER_KEY = "allowed_user_id"
 SUPERGROUP_KEY = "supergroup_id"
+SENDER_PREFIX_KEY = "sender_prefix"
 
 _MAX_URL_RE = re.compile(r"https?://(?:web\.)?max\.ru/(-?\d+)")
 
@@ -80,6 +81,42 @@ def _entities_to_max_elements(text: str, entities) -> list:
                 "attributes": {"url": e.url},
             })
     return elements
+
+
+def _prepare_outgoing_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                           text: str, entities) -> tuple[str, list]:
+    """Add optional sender attribution and keep the original text formatting."""
+    elements = _entities_to_max_elements(text, entities)
+    if not context.bot_data.get(SENDER_PREFIX_KEY, False):
+        return text, elements
+
+    # Anonymous administrators and messages sent on behalf of a channel have
+    # sender_chat set. Use its visible identity instead of GroupAnonymousBot.
+    sender_chat = update.message.sender_chat
+    if sender_chat:
+        name = sender_chat.title or sender_chat.full_name
+        username = sender_chat.username
+    elif update.effective_user:
+        name = update.effective_user.full_name
+        username = update.effective_user.username
+    else:
+        name = None
+        username = None
+    name = name or "неизвестного отправителя"
+
+    label = "Сообщение из Telegram от "
+    header = f"{label}{name}:"
+    prefix = f"{header}\n\n" if text else header
+    elements = [{**element, "from": element["from"] + len(prefix)}
+                for element in elements]
+    if username:
+        elements.insert(0, {
+            "type": "LINK",
+            "from": len(label),
+            "length": len(name),
+            "attributes": {"url": f"https://t.me/{username}"},
+        })
+    return prefix + text, elements
 
 
 def _parse_max_chat_id(s: str) -> int | None:
@@ -159,9 +196,11 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await message.reply_text("⚠️ Max клиент не подключён.")
         return
 
-    elements = _entities_to_max_elements(message.text, message.entities)
+    text, elements = _prepare_outgoing_text(
+        update, context, message.text, message.entities,
+    )
     try:
-        resp = await max_client.send_message(max_chat_id, message.text,
+        resp = await max_client.send_message(max_chat_id, text,
                                               elements=elements)
     except Exception:
         log.exception("Failed to send reply to Max chat %s", max_chat_id)
@@ -259,7 +298,9 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("⚠️ Не удалось загрузить файл в MAX.")
         return
 
-    elements = _entities_to_max_elements(caption, message.caption_entities)
+    caption, elements = _prepare_outgoing_text(
+        update, context, caption, message.caption_entities,
+    )
     try:
         resp = await max_client.send_message(max_chat_id, text=caption,
                                               elements=elements,
@@ -898,7 +939,8 @@ async def _cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
                  topic_store: TopicStore, allowed_user_id: int | None = None,
-                 proxy_url: str | None = None) -> Application:
+                 proxy_url: str | None = None,
+                 sender_prefix: bool = False) -> Application:
     """Build the Telegram Application that routes topic replies back to Max."""
     builder = Application.builder().token(token)
     if proxy_url:
@@ -908,6 +950,7 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.bot_data[TOPIC_STORE_KEY] = topic_store
     app.bot_data[ALLOWED_USER_KEY] = int(allowed_user_id) if allowed_user_id else None
     app.bot_data[SUPERGROUP_KEY] = int(supergroup_id)
+    app.bot_data[SENDER_PREFIX_KEY] = sender_prefix
 
     chat_filter = filters.Chat(chat_id=int(supergroup_id))
     app.add_handler(CommandHandler("bind", _cmd_bind, filters=chat_filter))

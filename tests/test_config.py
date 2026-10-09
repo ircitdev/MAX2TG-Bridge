@@ -50,6 +50,7 @@ class TestSettingsDataclass:
         )
         assert s.debug is False
         assert s.reply_enabled is False
+        assert s.tg_sender_prefix is False
         assert s.max_chat_ids is None
 
 
@@ -112,6 +113,20 @@ class TestLoadSettingsValid:
     def test_reply_enabled_false_via_false(self):
         s = _load_settings_with_env(_env(REPLY_ENABLED="false"))
         assert s.reply_enabled is False
+
+    def test_tg_sender_prefix_default_false(self):
+        s = _load_settings_with_env(_env())
+        assert s.tg_sender_prefix is False
+
+    @pytest.mark.parametrize("value", ["1", "true", "yes", "True", "YES"])
+    def test_tg_sender_prefix_enabled(self, value):
+        s = _load_settings_with_env(_env(TG_SENDER_PREFIX=value))
+        assert s.tg_sender_prefix is True
+
+    @pytest.mark.parametrize("value", ["", "0", "false", "no", "False", "unexpected"])
+    def test_tg_sender_prefix_disabled(self, value):
+        s = _load_settings_with_env(_env(TG_SENDER_PREFIX=value))
+        assert s.tg_sender_prefix is False
 
     def test_returns_settings_instance(self):
         s = _load_settings_with_env(_env())
